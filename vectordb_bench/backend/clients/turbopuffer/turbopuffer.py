@@ -5,6 +5,7 @@ import time
 from contextlib import contextmanager
 
 import turbopuffer as tpuf
+from tqdm import tqdm
 
 from vectordb_bench.backend.clients.turbopuffer.config import TurboPufferIndexConfig
 from vectordb_bench.backend.filter import Filter, FilterOp
@@ -34,6 +35,7 @@ class TurboPuffer(VectorDB):
         self.api_key = db_config.get("api_key", "")
         self.api_base_url = db_config.get("api_base_url", "")
         self.namespace = db_config.get("namespace", "")
+        self.consistency_level = db_config.get("consistency_level", "strong")
         self.db_case_config = db_case_config
         self.metric = db_case_config.parse_metric()
 
@@ -43,12 +45,11 @@ class TurboPuffer(VectorDB):
 
         self.with_scalar_labels = with_scalar_labels
 
-        # Initialize client with new SDK pattern
-        self.client = tpuf.Turbopuffer(api_key=self.api_key, base_url=self.api_base_url)
-
         if drop_old:
             log.info(f"Drop old. delete the namespace: {self.namespace}")
-            ns = self.client.namespace(self.namespace)
+            # Create temporary client for drop_old operation (not stored to avoid pickle issues)
+            client = tpuf.Turbopuffer(api_key=self.api_key, base_url=self.api_base_url)
+            ns = client.namespace(self.namespace)
             try:
                 ns.delete_all()
             except Exception as e:
@@ -56,17 +57,40 @@ class TurboPuffer(VectorDB):
 
     @contextmanager
     def init(self):
-        self.ns = self.client.namespace(self.namespace)
+        # Create client here (not in __init__) to avoid pickle issues with multiprocessing
+        client = tpuf.Turbopuffer(api_key=self.api_key, base_url=self.api_base_url)
+        self.ns = client.namespace(self.namespace)
         yield
 
     def optimize(self, data_size: int | None = None):
-        # turbopuffer responds to the request
-        #   once the cache warming operation has been started.
-        # It does not wait for the operation to complete,
-        #   which can take multiple minutes for large namespaces.
-        self.ns.hint_cache_warm()
-        log.info(f"warming up but no api waiting for complete. just sleep {self.db_case_config.time_wait_warmup}s")
-        time.sleep(self.db_case_config.time_wait_warmup)
+        # Wait for index to be fully built before warming cache
+        log.info("Waiting for index to be up-to-date...")
+        while True:
+            metadata = self.ns.metadata()
+            index_status = metadata.index.status if metadata.index else None
+            if index_status == "up-to-date":
+                log.info("Index is up-to-date")
+                break
+            unindexed = getattr(metadata.index, "unindexed_bytes", None) if metadata.index else None
+            log.info(f"Index status: {index_status}, unindexed_bytes: {unindexed}. Checking again in 10s...")
+            time.sleep(10)
+
+        # Start cache warming and poll until complete
+        # First call returns "cache warm hint accepted"
+        # Subsequent calls while warming return "cache is already warming"
+        # When warming is done, calling again returns "cache warm hint accepted"
+        log.info("Starting cache warm...")
+        response = self.ns.hint_cache_warm()
+        log.info(f"Cache warm response: {response}")
+
+        # Poll until we see "cache warm hint accepted" again (meaning warming completed)
+        while True:
+            time.sleep(5)
+            response = self.ns.hint_cache_warm()
+            log.info(f"Cache warm response: {response}")
+            if "accepted" in str(response).lower():
+                log.info("Cache warming complete")
+                break
 
     def insert_embeddings(
         self,
@@ -75,26 +99,48 @@ class TurboPuffer(VectorDB):
         labels_data: list[str] | None = None,
         **kwargs,
     ) -> tuple[int, Exception]:
+        # Calculate batch size based on target MB and vector dimensions
+        # Each float32 = 4 bytes, target_mb * 1024 * 1024 / (dims * 4)
+        if embeddings:
+            dims = len(embeddings[0])
+            target_bytes = self.db_case_config.batch_size_mb * 1024 * 1024
+            bytes_per_row = dims * 4
+            batch_size = max(1, target_bytes // bytes_per_row)
+        else:
+            batch_size = 10000
+
+        insert_count = 0
         try:
-            if self.with_scalar_labels:
-                self.ns.write(
-                    columns={
-                        self._scalar_id_field: metadata,
-                        self._vector_field: embeddings,
-                        self._scalar_label_field: labels_data,
-                    },
-                    distance_metric=self.metric,
-                )
-            else:
-                self.ns.write(
-                    columns={
-                        self._scalar_id_field: metadata,
-                        self._vector_field: embeddings,
-                    },
-                    distance_metric=self.metric,
-                )
+            with tqdm(total=len(embeddings), desc="Inserting vectors", unit="vec") as pbar:
+                for batch_start in range(0, len(embeddings), batch_size):
+                    batch_end = min(batch_start + batch_size, len(embeddings))
+                    batch_embeddings = embeddings[batch_start:batch_end]
+                    batch_metadata = metadata[batch_start:batch_end]
+
+                    if self.with_scalar_labels:
+                        batch_labels = labels_data[batch_start:batch_end]
+                        self.ns.write(
+                            upsert_columns={
+                                self._scalar_id_field: batch_metadata,
+                                self._vector_field: batch_embeddings,
+                                self._scalar_label_field: batch_labels,
+                            },
+                            distance_metric=self.metric,
+                        )
+                    else:
+                        self.ns.write(
+                            upsert_columns={
+                                self._scalar_id_field: batch_metadata,
+                                self._vector_field: batch_embeddings,
+                            },
+                            distance_metric=self.metric,
+                        )
+                    batch_count = batch_end - batch_start
+                    insert_count += batch_count
+                    pbar.update(batch_count)
         except Exception as e:
             log.warning(f"Failed to insert. Error: {e}")
+            return insert_count, e
         return len(embeddings), None
 
     def search_embedding(
@@ -103,10 +149,18 @@ class TurboPuffer(VectorDB):
         k: int = 100,
         timeout: int | None = None,
     ) -> list[int]:
+        
+        # Build consistency parameter based on configured level
+        consistency = None
+        if self.consistency_level == "eventual":
+            consistency = {"level": "eventual"}
+        # For "strong" consistency, we can omit the parameter (default behavior)
+
         res = self.ns.query(
             rank_by=("vector", "ANN", query),
             top_k=k,
             filters=self.expr,
+            consistency=consistency,
         )
         return [row.id for row in res.rows] if res.rows is not None else []
 
