@@ -60,10 +60,23 @@ class TurboPuffer(VectorDB):
         # Create client here (not in __init__) to avoid pickle issues with multiprocessing
         client = tpuf.Turbopuffer(api_key=self.api_key, base_url=self.api_base_url)
         self.ns = client.namespace(self.namespace)
+
+        # Only warm cache if namespace has data (skip during initial load)
+        try:
+            metadata = self.ns.metadata()
+            row_count = getattr(metadata, "approx_row_count", 0) or 0
+            if row_count > 0:
+                log.info(f"Namespace has {row_count} rows, ensuring ready for search...")
+                self._warm_cache()
+            else:
+                log.info("Namespace is empty, skipping cache warm")
+        except Exception as e:
+            log.warning(f"Could not check namespace metadata: {e}")
+
         yield
 
-    def optimize(self, data_size: int | None = None):
-        # Wait for index to be fully built before warming cache
+    def _wait_for_index(self):
+        """Wait for index to be fully built."""
         log.info("Waiting for index to be up-to-date...")
         while True:
             metadata = self.ns.metadata()
@@ -75,13 +88,13 @@ class TurboPuffer(VectorDB):
             log.info(f"Index status: {index_status}, unindexed_bytes: {unindexed}. Checking again in 10s...")
             time.sleep(10)
 
-        # Start cache warming and poll until complete
+    def _warm_cache(self):
+        """Start cache warming and poll until complete."""
         # First call returns "cache warm hint accepted"
         # Subsequent calls while warming return "cache is already warming"
         # When warming is done, calling again returns "cache warm hint accepted"
         log.info("Starting cache warm...")
         response = self.ns.hint_cache_warm()
-        log.info(f"Cache warm response: {response}")
 
         # Poll until we see "cache warm hint accepted" again (meaning warming completed)
         while True:
@@ -91,6 +104,11 @@ class TurboPuffer(VectorDB):
             if "accepted" in str(response).lower():
                 log.info("Cache warming complete")
                 break
+
+    def optimize(self, data_size: int | None = None):
+        """Called after loading data - wait for index then warm cache."""
+        self._wait_for_index()
+        self._warm_cache()
 
     def insert_embeddings(
         self,
