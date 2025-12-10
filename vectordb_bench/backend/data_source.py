@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import pathlib
 import typing
@@ -137,10 +138,23 @@ class AwsS3Reader(DatasetReader):
         if len(downloads) == 0:
             return
 
-        log.info(f"Start to downloading files, total count: {len(downloads)}")
-        for s3_file in tqdm(downloads):
+        log.info(f"Start to downloading files in parallel, total count: {len(downloads)}")
+
+        async def download_file(s3_file):
+            import s3fs
+            fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": "us-west-2"})
             log.debug(f"downloading file {s3_file} to {local_ds_root}")
-            self.fs.download(s3_file, local_ds_root.as_posix())
+            await asyncio.to_thread(fs.download, s3_file, local_ds_root.as_posix())
+            return s3_file
+
+        async def download_all():
+            tasks = [download_file(s3_file) for s3_file in downloads]
+            with tqdm(total=len(downloads), desc="Downloading") as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    await coro
+                    pbar.update(1)
+
+        asyncio.run(download_all())
 
         log.info(f"Succeed to download all files, downloaded file count = {len(downloads)}")
 
