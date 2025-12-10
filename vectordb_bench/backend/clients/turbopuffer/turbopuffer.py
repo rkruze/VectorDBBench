@@ -5,7 +5,6 @@ import time
 from contextlib import contextmanager
 
 import turbopuffer as tpuf
-from tqdm import tqdm
 
 from vectordb_bench.backend.clients.turbopuffer.config import TurboPufferIndexConfig
 from vectordb_bench.backend.filter import Filter, FilterOp
@@ -129,35 +128,32 @@ class TurboPuffer(VectorDB):
 
         insert_count = 0
         try:
-            with tqdm(total=len(embeddings), desc="Inserting vectors", unit="vec") as pbar:
-                for batch_start in range(0, len(embeddings), batch_size):
-                    batch_end = min(batch_start + batch_size, len(embeddings))
-                    batch_embeddings = embeddings[batch_start:batch_end]
-                    batch_metadata = metadata[batch_start:batch_end]
+            for batch_start in range(0, len(embeddings), batch_size):
+                batch_end = min(batch_start + batch_size, len(embeddings))
+                batch_embeddings = embeddings[batch_start:batch_end]
+                batch_metadata = metadata[batch_start:batch_end]
 
-                    if self.with_scalar_labels:
-                        batch_labels = labels_data[batch_start:batch_end]
-                        self.ns.write(
-                            upsert_columns={
-                                self._scalar_id_field: batch_metadata,
-                                self._vector_field: batch_embeddings,
-                                self._scalar_label_field: batch_labels,
-                            },
-                            distance_metric=self.metric,
-                            disable_backpressure=True,
-                        )
-                    else:
-                        self.ns.write(
-                            upsert_columns={
-                                self._scalar_id_field: batch_metadata,
-                                self._vector_field: batch_embeddings,
-                            },
-                            distance_metric=self.metric,
-                            disable_backpressure=True,
-                        )
-                    batch_count = batch_end - batch_start
-                    insert_count += batch_count
-                    pbar.update(batch_count)
+                if self.with_scalar_labels:
+                    batch_labels = labels_data[batch_start:batch_end]
+                    self.ns.write(
+                        upsert_columns={
+                            self._scalar_id_field: batch_metadata,
+                            self._vector_field: batch_embeddings,
+                            self._scalar_label_field: batch_labels,
+                        },
+                        distance_metric=self.metric,
+                        disable_backpressure=True,
+                    )
+                else:
+                    self.ns.write(
+                        upsert_columns={
+                            self._scalar_id_field: batch_metadata,
+                            self._vector_field: batch_embeddings,
+                        },
+                        distance_metric=self.metric,
+                        disable_backpressure=True,
+                    )
+                insert_count += batch_end - batch_start
         except Exception as e:
             log.warning(f"Failed to insert. Error: {e}")
             return insert_count, e

@@ -149,7 +149,7 @@ class SerialInsertRunner:
             )
         return count
 
-    def _worker_task_by_files(self, worker_id: int, file_names: list[str], shared_counter) -> int:
+    def _worker_task_by_files(self, worker_id: int, file_names: list[str], progress_queue) -> int:
         """Worker task that loads files on-demand to avoid memory issues."""
         count = 0
         with self.db.init():
@@ -197,9 +197,8 @@ class SerialInsertRunner:
                             labels_data=labels_data,
                         )
                     count += insert_count
-                    # Update shared counter for progress tracking
-                    with shared_counter.get_lock():
-                        shared_counter.value += insert_count
+                    # Send progress update to main process via queue
+                    progress_queue.put(insert_count)
 
                 log.debug(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
             log.info(f"Worker {worker_id}: Finished all files, total: {count} embeddings")
@@ -223,23 +222,29 @@ class SerialInsertRunner:
         for i, file_name in enumerate(train_files):
             files_per_worker[i % num_workers].append(file_name)
 
-        # Shared counter for progress tracking across processes
-        shared_counter = mp.Value("i", 0)
+        # Use Manager queue for progress tracking (works with spawn context)
+        manager = mp.Manager()
+        progress_queue = manager.Queue()
         stop_progress = threading.Event()
 
         def update_progress_bar():
             with tqdm(total=total_vectors, desc="Inserting vectors", unit="vec") as pbar:
-                last_count = 0
                 while not stop_progress.is_set():
-                    current = shared_counter.value
-                    if current > last_count:
-                        pbar.update(current - last_count)
-                        last_count = current
-                    time.sleep(0.5)
-                # Final update
-                current = shared_counter.value
-                if current > last_count:
-                    pbar.update(current - last_count)
+                    try:
+                        # Non-blocking get with timeout
+                        while True:
+                            increment = progress_queue.get_nowait()
+                            pbar.update(increment)
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                # Drain remaining items
+                try:
+                    while True:
+                        increment = progress_queue.get_nowait()
+                        pbar.update(increment)
+                except Exception:
+                    pass
 
         progress_thread = threading.Thread(target=update_progress_bar)
         progress_thread.start()
@@ -250,7 +255,7 @@ class SerialInsertRunner:
                 max_workers=num_workers,
             ) as executor:
                 futures = [
-                    executor.submit(self._worker_task_by_files, worker_id, files, shared_counter)
+                    executor.submit(self._worker_task_by_files, worker_id, files, progress_queue)
                     for worker_id, files in enumerate(files_per_worker)
                     if files  # Skip empty worker assignments
                 ]
