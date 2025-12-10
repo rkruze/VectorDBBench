@@ -158,8 +158,15 @@ class SerialInsertRunner:
                 file_path = pathlib.Path(self.dataset.data_dir, file_name)
                 log.info(f"Worker {worker_id}: Processing {file_name}")
 
+                # Calculate batch size to target ~256MB per batch
+                # Each vector = dims * 4 bytes (float32)
+                target_mb = 256
+                dims = self.dataset.data.dim
+                bytes_per_vector = dims * 4
+                batch_size = (target_mb * 1024 * 1024) // bytes_per_vector
+
                 # Iterate through batches in this file
-                for batch in ParquetFile(file_path, memory_map=True, pre_buffer=True).iter_batches(NUM_PER_BATCH):
+                for batch in ParquetFile(file_path, memory_map=True, pre_buffer=True).iter_batches(batch_size):
                     data_df = batch.to_pandas()
                     all_metadata = data_df[self.dataset.data.train_id_field].tolist()
 
