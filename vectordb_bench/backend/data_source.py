@@ -139,16 +139,19 @@ class AwsS3Reader(DatasetReader):
             return
 
         log.info(f"Start to downloading files in parallel, total count: {len(downloads)}")
+        max_concurrent = 12
 
-        async def download_file(s3_file):
+        async def download_file(s3_file, semaphore):
             import s3fs
-            fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": "us-west-2"})
-            log.debug(f"downloading file {s3_file} to {local_ds_root}")
-            await asyncio.to_thread(fs.download, s3_file, local_ds_root.as_posix())
+            async with semaphore:
+                fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": "us-west-2"})
+                log.debug(f"downloading file {s3_file} to {local_ds_root}")
+                await asyncio.to_thread(fs.download, s3_file, local_ds_root.as_posix())
             return s3_file
 
         async def download_all():
-            tasks = [download_file(s3_file) for s3_file in downloads]
+            semaphore = asyncio.Semaphore(max_concurrent)
+            tasks = [download_file(s3_file, semaphore) for s3_file in downloads]
             with tqdm(total=len(downloads), desc="Downloading") as pbar:
                 for coro in asyncio.as_completed(tasks):
                     await coro
