@@ -147,16 +147,72 @@ class SerialInsertRunner:
             )
         return count
 
+    def _worker_task(self, worker_id: int, data_batches: list) -> int:
+        """Worker task for parallel insertion."""
+        count = 0
+        with self.db.init():
+            log.info(f"Worker {worker_id}: Starting insertion of {len(data_batches)} batches")
+            for data_df in data_batches:
+                all_metadata = data_df[self.dataset.data.train_id_field].tolist()
+
+                emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
+                if self.normalize:
+                    all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
+                else:
+                    all_embeddings = emb_np.tolist()
+                del emb_np
+
+                labels_data = None
+                if self.filters.type == FilterOp.StrEqual:
+                    if self.dataset.data.scalar_labels_file_separated:
+                        labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
+                    else:
+                        labels_data = data_df[self.filters.label_field].tolist()
+
+                insert_count, error = self.db.insert_embeddings(
+                    embeddings=all_embeddings,
+                    metadata=all_metadata,
+                    labels_data=labels_data,
+                )
+                if error is not None:
+                    self.retry_insert(
+                        self.db,
+                        embeddings=all_embeddings,
+                        metadata=all_metadata,
+                        labels_data=labels_data,
+                    )
+                count += insert_count
+            log.info(f"Worker {worker_id}: Finished inserting {count} embeddings")
+        return count
+
     @utils.time_it
     def _insert_all_batches(self) -> int:
-        """Performance case only"""
+        """Performance case only - parallel insertion with multiple workers"""
+        num_workers = 12  # Configure number of parallel workers
+
+        # Collect all data batches first
+        all_batches = list(self.dataset)
+        log.info(f"Collected {len(all_batches)} batches, distributing across {num_workers} workers")
+
+        # Distribute batches across workers
+        batches_per_worker = [[] for _ in range(num_workers)]
+        for i, batch in enumerate(all_batches):
+            batches_per_worker[i % num_workers].append(batch)
+
         with concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("spawn"),
-            max_workers=1,
+            max_workers=num_workers,
         ) as executor:
-            future = executor.submit(self.task)
+            futures = [
+                executor.submit(self._worker_task, worker_id, batches)
+                for worker_id, batches in enumerate(batches_per_worker)
+                if batches  # Skip empty worker assignments
+            ]
             try:
-                count = future.result(timeout=self.timeout)
+                total_count = 0
+                for future in concurrent.futures.as_completed(futures, timeout=self.timeout):
+                    total_count += future.result()
+                return total_count
             except TimeoutError as e:
                 msg = f"VectorDB load dataset timeout in {self.timeout}"
                 log.warning(msg)
@@ -166,8 +222,6 @@ class SerialInsertRunner:
             except Exception as e:
                 log.warning(f"VectorDB load dataset error: {e}")
                 raise e from e
-            else:
-                return count
 
     def run_endlessness(self) -> int:
         """run forever util DB raises exception or crash"""

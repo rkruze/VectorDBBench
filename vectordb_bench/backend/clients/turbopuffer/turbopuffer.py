@@ -144,6 +144,7 @@ class TurboPuffer(VectorDB):
                                 self._scalar_label_field: batch_labels,
                             },
                             distance_metric=self.metric,
+                            disable_backpressure=True,
                         )
                     else:
                         self.ns.write(
@@ -152,6 +153,7 @@ class TurboPuffer(VectorDB):
                                 self._vector_field: batch_embeddings,
                             },
                             distance_metric=self.metric,
+                            disable_backpressure=True,
                         )
                     batch_count = batch_end - batch_start
                     insert_count += batch_count
