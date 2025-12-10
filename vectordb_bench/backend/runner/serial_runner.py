@@ -152,56 +152,63 @@ class SerialInsertRunner:
     def _worker_task_by_files(self, worker_id: int, file_names: list[str], progress_queue) -> int:
         """Worker task that loads files on-demand to avoid memory issues."""
         count = 0
-        with self.db.init():
-            log.info(f"Worker {worker_id}: Starting insertion of {len(file_names)} files")
-            for file_name in file_names:
-                file_path = pathlib.Path(self.dataset.data_dir, file_name)
-                log.debug(f"Worker {worker_id}: Processing {file_name}")
+        try:
+            with self.db.init():
+                log.info(f"Worker {worker_id}: Starting insertion of {len(file_names)} files")
+                for file_name in file_names:
+                    file_path = pathlib.Path(self.dataset.data_dir, file_name)
+                    log.info(f"Worker {worker_id}: Processing {file_name}")
 
-                # Calculate batch size to target ~256MB per batch
-                # Each vector = dims * 4 bytes (float32)
-                target_mb = 256
-                dims = self.dataset.data.dim
-                bytes_per_vector = dims * 4
-                batch_size = (target_mb * 1024 * 1024) // bytes_per_vector
+                    # Calculate batch size to target ~64MB per batch (conservative for 12 workers)
+                    # Each vector = dims * 4 bytes (float32)
+                    target_mb = 64
+                    dims = self.dataset.data.dim
+                    bytes_per_vector = dims * 4
+                    batch_size = (target_mb * 1024 * 1024) // bytes_per_vector
 
-                # Iterate through batches in this file
-                for batch in ParquetFile(file_path, memory_map=True, pre_buffer=True).iter_batches(batch_size):
-                    data_df = batch.to_pandas()
-                    all_metadata = data_df[self.dataset.data.train_id_field].tolist()
+                    # Iterate through batches in this file
+                    for batch in ParquetFile(file_path, memory_map=True, pre_buffer=True).iter_batches(batch_size):
+                        data_df = batch.to_pandas()
+                        all_metadata = data_df[self.dataset.data.train_id_field].tolist()
 
-                    emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
-                    if self.normalize:
-                        all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
-                    else:
-                        all_embeddings = emb_np.tolist()
-                    del emb_np
-
-                    labels_data = None
-                    if self.filters.type == FilterOp.StrEqual:
-                        if self.dataset.data.scalar_labels_file_separated:
-                            labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
+                        emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
+                        if self.normalize:
+                            all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
                         else:
-                            labels_data = data_df[self.filters.label_field].tolist()
+                            all_embeddings = emb_np.tolist()
+                        del emb_np
 
-                    insert_count, error = self.db.insert_embeddings(
-                        embeddings=all_embeddings,
-                        metadata=all_metadata,
-                        labels_data=labels_data,
-                    )
-                    if error is not None:
-                        self.retry_insert(
-                            self.db,
+                        labels_data = None
+                        if self.filters.type == FilterOp.StrEqual:
+                            if self.dataset.data.scalar_labels_file_separated:
+                                labels_data = self.dataset.scalar_labels[
+                                    self.filters.label_field][all_metadata].to_list()
+                            else:
+                                labels_data = data_df[self.filters.label_field].tolist()
+                        del data_df
+
+                        insert_count, error = self.db.insert_embeddings(
                             embeddings=all_embeddings,
                             metadata=all_metadata,
                             labels_data=labels_data,
                         )
-                    count += insert_count
-                    # Send progress update to main process via queue
-                    progress_queue.put(insert_count)
+                        del all_embeddings
+                        del all_metadata
 
-                log.debug(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
-            log.info(f"Worker {worker_id}: Finished all files, total: {count} embeddings")
+                        if error is not None:
+                            log.warning(f"Worker {worker_id}: Insert error: {error}")
+                            raise error
+
+                        count += insert_count
+                        # Send progress update to main process via queue
+                        progress_queue.put(insert_count)
+
+                    log.info(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
+                log.info(f"Worker {worker_id}: Finished all files, total: {count} embeddings")
+        except Exception as e:
+            log.error(f"Worker {worker_id}: Fatal error: {e}")
+            traceback.print_exc()
+            raise
         return count
 
     @utils.time_it
@@ -210,11 +217,13 @@ class SerialInsertRunner:
         from tqdm import tqdm
         import threading
 
-        num_workers = 12  # Configure number of parallel workers
-
-        # Get list of train files and distribute across workers
+        # Get list of train files
         train_files = list(self.dataset.train_files)
         total_vectors = self.dataset.data.size
+
+        # Limit workers to number of files (no point having more workers than files)
+        # Also limit to 4 workers to avoid memory issues with large parquet files
+        num_workers = min(4, len(train_files))
         log.info(f"Distributing {len(train_files)} files across {num_workers} workers, total vectors: {total_vectors}")
 
         # Distribute files across workers (round-robin)
