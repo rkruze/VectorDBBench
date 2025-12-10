@@ -2,11 +2,13 @@ import concurrent
 import logging
 import math
 import multiprocessing as mp
+import pathlib
 import time
 import traceback
 
 import numpy as np
 import psutil
+from pyarrow.parquet import ParquetFile
 
 from vectordb_bench.backend.dataset import DatasetManager
 from vectordb_bench.backend.filter import Filter, FilterOp, non_filter
@@ -147,42 +149,50 @@ class SerialInsertRunner:
             )
         return count
 
-    def _worker_task(self, worker_id: int, data_batches: list) -> int:
-        """Worker task for parallel insertion."""
+    def _worker_task_by_files(self, worker_id: int, file_names: list[str]) -> int:
+        """Worker task that loads files on-demand to avoid memory issues."""
         count = 0
         with self.db.init():
-            log.info(f"Worker {worker_id}: Starting insertion of {len(data_batches)} batches")
-            for data_df in data_batches:
-                all_metadata = data_df[self.dataset.data.train_id_field].tolist()
+            log.info(f"Worker {worker_id}: Starting insertion of {len(file_names)} files")
+            for file_name in file_names:
+                file_path = pathlib.Path(self.dataset.data_dir, file_name)
+                log.info(f"Worker {worker_id}: Processing {file_name}")
 
-                emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
-                if self.normalize:
-                    all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
-                else:
-                    all_embeddings = emb_np.tolist()
-                del emb_np
+                # Iterate through batches in this file
+                for batch in ParquetFile(file_path, memory_map=True, pre_buffer=True).iter_batches(NUM_PER_BATCH):
+                    data_df = batch.to_pandas()
+                    all_metadata = data_df[self.dataset.data.train_id_field].tolist()
 
-                labels_data = None
-                if self.filters.type == FilterOp.StrEqual:
-                    if self.dataset.data.scalar_labels_file_separated:
-                        labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
+                    emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
+                    if self.normalize:
+                        all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
                     else:
-                        labels_data = data_df[self.filters.label_field].tolist()
+                        all_embeddings = emb_np.tolist()
+                    del emb_np
 
-                insert_count, error = self.db.insert_embeddings(
-                    embeddings=all_embeddings,
-                    metadata=all_metadata,
-                    labels_data=labels_data,
-                )
-                if error is not None:
-                    self.retry_insert(
-                        self.db,
+                    labels_data = None
+                    if self.filters.type == FilterOp.StrEqual:
+                        if self.dataset.data.scalar_labels_file_separated:
+                            labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
+                        else:
+                            labels_data = data_df[self.filters.label_field].tolist()
+
+                    insert_count, error = self.db.insert_embeddings(
                         embeddings=all_embeddings,
                         metadata=all_metadata,
                         labels_data=labels_data,
                     )
-                count += insert_count
-            log.info(f"Worker {worker_id}: Finished inserting {count} embeddings")
+                    if error is not None:
+                        self.retry_insert(
+                            self.db,
+                            embeddings=all_embeddings,
+                            metadata=all_metadata,
+                            labels_data=labels_data,
+                        )
+                    count += insert_count
+
+                log.info(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
+            log.info(f"Worker {worker_id}: Finished all files, total: {count} embeddings")
         return count
 
     @utils.time_it
@@ -190,23 +200,23 @@ class SerialInsertRunner:
         """Performance case only - parallel insertion with multiple workers"""
         num_workers = 12  # Configure number of parallel workers
 
-        # Collect all data batches first
-        all_batches = list(self.dataset)
-        log.info(f"Collected {len(all_batches)} batches, distributing across {num_workers} workers")
+        # Get list of train files and distribute across workers
+        train_files = list(self.dataset.train_files)
+        log.info(f"Distributing {len(train_files)} files across {num_workers} workers")
 
-        # Distribute batches across workers
-        batches_per_worker = [[] for _ in range(num_workers)]
-        for i, batch in enumerate(all_batches):
-            batches_per_worker[i % num_workers].append(batch)
+        # Distribute files across workers (round-robin)
+        files_per_worker = [[] for _ in range(num_workers)]
+        for i, file_name in enumerate(train_files):
+            files_per_worker[i % num_workers].append(file_name)
 
         with concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("spawn"),
             max_workers=num_workers,
         ) as executor:
             futures = [
-                executor.submit(self._worker_task, worker_id, batches)
-                for worker_id, batches in enumerate(batches_per_worker)
-                if batches  # Skip empty worker assignments
+                executor.submit(self._worker_task_by_files, worker_id, files)
+                for worker_id, files in enumerate(files_per_worker)
+                if files  # Skip empty worker assignments
             ]
             try:
                 total_count = 0
