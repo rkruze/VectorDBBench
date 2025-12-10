@@ -149,14 +149,14 @@ class SerialInsertRunner:
             )
         return count
 
-    def _worker_task_by_files(self, worker_id: int, file_names: list[str]) -> int:
+    def _worker_task_by_files(self, worker_id: int, file_names: list[str], shared_counter) -> int:
         """Worker task that loads files on-demand to avoid memory issues."""
         count = 0
         with self.db.init():
             log.info(f"Worker {worker_id}: Starting insertion of {len(file_names)} files")
             for file_name in file_names:
                 file_path = pathlib.Path(self.dataset.data_dir, file_name)
-                log.info(f"Worker {worker_id}: Processing {file_name}")
+                log.debug(f"Worker {worker_id}: Processing {file_name}")
 
                 # Calculate batch size to target ~256MB per batch
                 # Each vector = dims * 4 bytes (float32)
@@ -197,48 +197,80 @@ class SerialInsertRunner:
                             labels_data=labels_data,
                         )
                     count += insert_count
+                    # Update shared counter for progress tracking
+                    with shared_counter.get_lock():
+                        shared_counter.value += insert_count
 
-                log.info(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
+                log.debug(f"Worker {worker_id}: Finished {file_name}, total so far: {count}")
             log.info(f"Worker {worker_id}: Finished all files, total: {count} embeddings")
         return count
 
     @utils.time_it
     def _insert_all_batches(self) -> int:
         """Performance case only - parallel insertion with multiple workers"""
+        from tqdm import tqdm
+        import threading
+
         num_workers = 12  # Configure number of parallel workers
 
         # Get list of train files and distribute across workers
         train_files = list(self.dataset.train_files)
-        log.info(f"Distributing {len(train_files)} files across {num_workers} workers")
+        total_vectors = self.dataset.data.size
+        log.info(f"Distributing {len(train_files)} files across {num_workers} workers, total vectors: {total_vectors}")
 
         # Distribute files across workers (round-robin)
         files_per_worker = [[] for _ in range(num_workers)]
         for i, file_name in enumerate(train_files):
             files_per_worker[i % num_workers].append(file_name)
 
-        with concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context("spawn"),
-            max_workers=num_workers,
-        ) as executor:
-            futures = [
-                executor.submit(self._worker_task_by_files, worker_id, files)
-                for worker_id, files in enumerate(files_per_worker)
-                if files  # Skip empty worker assignments
-            ]
-            try:
-                total_count = 0
-                for future in concurrent.futures.as_completed(futures, timeout=self.timeout):
-                    total_count += future.result()
-                return total_count
-            except TimeoutError as e:
-                msg = f"VectorDB load dataset timeout in {self.timeout}"
-                log.warning(msg)
-                for pid, _ in executor._processes.items():
-                    psutil.Process(pid).kill()
-                raise PerformanceTimeoutError(msg) from e
-            except Exception as e:
-                log.warning(f"VectorDB load dataset error: {e}")
-                raise e from e
+        # Shared counter for progress tracking across processes
+        shared_counter = mp.Value("i", 0)
+        stop_progress = threading.Event()
+
+        def update_progress_bar():
+            with tqdm(total=total_vectors, desc="Inserting vectors", unit="vec") as pbar:
+                last_count = 0
+                while not stop_progress.is_set():
+                    current = shared_counter.value
+                    if current > last_count:
+                        pbar.update(current - last_count)
+                        last_count = current
+                    time.sleep(0.5)
+                # Final update
+                current = shared_counter.value
+                if current > last_count:
+                    pbar.update(current - last_count)
+
+        progress_thread = threading.Thread(target=update_progress_bar)
+        progress_thread.start()
+
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                mp_context=mp.get_context("spawn"),
+                max_workers=num_workers,
+            ) as executor:
+                futures = [
+                    executor.submit(self._worker_task_by_files, worker_id, files, shared_counter)
+                    for worker_id, files in enumerate(files_per_worker)
+                    if files  # Skip empty worker assignments
+                ]
+                try:
+                    total_count = 0
+                    for future in concurrent.futures.as_completed(futures, timeout=self.timeout):
+                        total_count += future.result()
+                    return total_count
+                except TimeoutError as e:
+                    msg = f"VectorDB load dataset timeout in {self.timeout}"
+                    log.warning(msg)
+                    for pid, _ in executor._processes.items():
+                        psutil.Process(pid).kill()
+                    raise PerformanceTimeoutError(msg) from e
+                except Exception as e:
+                    log.warning(f"VectorDB load dataset error: {e}")
+                    raise e from e
+        finally:
+            stop_progress.set()
+            progress_thread.join()
 
     def run_endlessness(self) -> int:
         """run forever util DB raises exception or crash"""
