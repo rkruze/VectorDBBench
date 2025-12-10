@@ -223,7 +223,7 @@ class SerialInsertRunner:
 
         # Limit workers to number of files (no point having more workers than files)
         # Also limit to 4 workers to avoid memory issues with large parquet files
-        num_workers = min(4, len(train_files))
+        num_workers = min(8, len(train_files))
         log.info(f"Distributing {len(train_files)} files across {num_workers} workers, total vectors: {total_vectors}")
 
         # Distribute files across workers (round-robin)
