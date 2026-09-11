@@ -1,9 +1,10 @@
-"""Wrapper around the Pinecone vector database over VectorDB"""
-
+import base64
 import logging
 import time
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
+import numpy as np
 import turbopuffer as tpuf
 
 from vectordb_bench.backend.clients.turbopuffer.config import TurboPufferIndexConfig
@@ -30,12 +31,13 @@ class TurboPuffer(VectorDB):
         with_scalar_labels: bool = False,
         **kwargs,
     ):
-        """Initialize wrapper around the milvus vector database."""
         self.api_key = db_config.get("api_key", "")
         self.api_base_url = db_config.get("api_base_url", "")
         self.namespace = db_config.get("namespace", "")
         self.db_case_config = db_case_config
         self.metric = db_case_config.parse_metric()
+        self.dim = dim
+        self.expr = None
 
         self._vector_field = "vector"
         self._scalar_id_field = "id"
@@ -43,27 +45,39 @@ class TurboPuffer(VectorDB):
 
         self.with_scalar_labels = with_scalar_labels
 
-        # Initialize client with new SDK pattern
-        self.client = tpuf.Turbopuffer(api_key=self.api_key, base_url=self.api_base_url)
-
         if drop_old:
             log.info(f"Drop old. delete the namespace: {self.namespace}")
-            ns = self.client.namespace(self.namespace)
-            try:
-                ns.delete_all()
-            except Exception as e:
-                log.warning(f"Failed to delete all. Error: {e}")
+            with tpuf.Turbopuffer(**self._client_options()) as client:
+                try:
+                    client.namespace(self.namespace).delete_all()
+                except tpuf.NotFoundError:
+                    log.info("Namespace does not exist yet")
+
+    def _client_options(self) -> dict:
+        options = {"api_key": self.api_key, "base_url": self.api_base_url, "compression": True}
+        host = urlsplit(self.api_base_url).hostname or ""
+        if host.endswith(".turbopuffer.com") and host != "api.turbopuffer.com":
+            options["region"] = host.removesuffix(".turbopuffer.com")
+            options["base_url"] = self.api_base_url.replace(host, "{region}.turbopuffer.com", 1)
+        return options
 
     @contextmanager
     def init(self):
-        self.ns = self.client.namespace(self.namespace)
-        yield
+        with tpuf.Turbopuffer(**self._client_options()) as client:
+            self.ns = client.namespace(self.namespace)
+            try:
+                yield
+            except tpuf.APIError as exc:
+                raise RuntimeError(str(exc)) from exc
+            finally:
+                del self.ns
 
     def optimize(self, data_size: int | None = None):
-        # turbopuffer responds to the request
-        #   once the cache warming operation has been started.
-        # It does not wait for the operation to complete,
-        #   which can take multiple minutes for large namespaces.
+        while True:
+            index = self.ns.metadata().index
+            if index and index.status == "up-to-date":
+                break
+            time.sleep(10)
         self.ns.hint_cache_warm()
         log.info(f"warming up but no api waiting for complete. just sleep {self.db_case_config.time_wait_warmup}s")
         time.sleep(self.db_case_config.time_wait_warmup)
@@ -74,27 +88,27 @@ class TurboPuffer(VectorDB):
         metadata: list[int],
         labels_data: list[str] | None = None,
         **kwargs,
-    ) -> tuple[int, Exception]:
+    ) -> tuple[int, Exception | None]:
         try:
+            if len(embeddings) != len(metadata):
+                return 0, ValueError("Vector and ID counts must match")
+            if not len(embeddings):
+                return 0, None
+            vectors = np.asarray(embeddings, dtype="<f4")
+            if vectors.shape != (len(metadata), self.dim) or not np.isfinite(vectors).all():
+                return 0, ValueError("Invalid vector dimension or non-finite value")
+            columns = {
+                self._scalar_id_field: metadata,
+                self._vector_field: [base64.b64encode(vector.tobytes()).decode("ascii") for vector in vectors],
+            }
             if self.with_scalar_labels:
-                self.ns.write(
-                    columns={
-                        self._scalar_id_field: metadata,
-                        self._vector_field: embeddings,
-                        self._scalar_label_field: labels_data,
-                    },
-                    distance_metric=self.metric,
-                )
-            else:
-                self.ns.write(
-                    columns={
-                        self._scalar_id_field: metadata,
-                        self._vector_field: embeddings,
-                    },
-                    distance_metric=self.metric,
-                )
+                if labels_data is None or len(labels_data) != len(metadata):
+                    return 0, ValueError("Label and ID counts must match")
+                columns[self._scalar_label_field] = labels_data
+            self.ns.write(upsert_columns=columns, distance_metric=self.metric)
         except Exception as e:
             log.warning(f"Failed to insert. Error: {e}")
+            return 0, RuntimeError(f"{type(e).__name__}: {e}")
         return len(embeddings), None
 
     def search_embedding(
@@ -107,8 +121,10 @@ class TurboPuffer(VectorDB):
             rank_by=("vector", "ANN", query),
             top_k=k,
             filters=self.expr,
+            include_attributes=False,
+            timeout=timeout if timeout is not None else tpuf.NOT_GIVEN,
         )
-        return [row.id for row in res.rows] if res.rows is not None else []
+        return [int(row.id) for row in res.rows] if res.rows is not None else []
 
     def prepare_filter(self, filters: Filter):
         if filters.type == FilterOp.NonFilter:
